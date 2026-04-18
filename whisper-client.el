@@ -1,9 +1,8 @@
-;;; themes/whisper-client.el -*- lexical-binding: t; -*-
 ;;; whisper-client.el --- Async voice transcription via Whisper API -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2025  Your Name
+;; Copyright (C) 2026 Haller33
 
-;; Author: Your Name <you@example.com>
+;; Author: Eliseu Lucena Barros <you@example.com>
 ;; Version: 0.3.0
 ;; Package-Requires: ((emacs "30") (transient "0.4") (seq "2.24"))
 ;; Keywords: convenience, multimedia, tools
@@ -163,8 +162,7 @@ Returns a list of plists."
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-url-parse-json (response)
-  "Extract and parse JSON from an HTTP RESPONSE buffer.
-Returns the parsed data as an alist (for objects) or vector (for arrays)."
+  "Extract and parse JSON from an HTTP RESPONSE buffer."
   (with-current-buffer response
     (goto-char (point-min))
     (if (re-search-forward "\n\n" nil t)
@@ -172,9 +170,32 @@ Returns the parsed data as an alist (for objects) or vector (for arrays)."
           (ignore-errors (json-parse-string json-string :object-type 'alist)))
       nil)))
 
+(defun whisper-client--is-error-response (response)
+  "Return non-nil if RESPONSE is an alist containing a non-null `error' field."
+  (and (consp response)                     ; must be a list
+       (not (vectorp response))             ; not a vector
+       (let ((err (cdr (assq 'error response))))
+         (and err (not (eq err :null))))))  ; error present and not :null
+
+(defun whisper-client-api-get (endpoint callback &optional error-callback)
+  "Send a GET request to ENDPOINT."
+  (let ((url (concat whisper-client-api-url endpoint)))
+    (url-retrieve url
+                  (lambda (status)
+                    (let ((err (plist-get status :error)))
+                      (if err
+                          (when error-callback (funcall error-callback (format "Network error: %s" err)))
+                        (let* ((response-buffer (current-buffer))
+                               (json-response (whisper-client-url-parse-json response-buffer)))
+                          (kill-buffer response-buffer)
+                          (if (whisper-client--is-error-response json-response)
+                              (when error-callback
+                                (funcall error-callback (format "API error: %s" (cdr (assq 'error json-response)))))
+                            (funcall callback json-response))))))
+                  nil nil t)))
+
 (defun whisper-client-api-post (endpoint data callback &optional error-callback)
-  "Send a POST request to ENDPOINT with DATA (alist).
-CALLBACK receives parsed JSON (alist or vector)."
+  "Send a POST request to ENDPOINT with DATA (alist)."
   (let* ((url (concat whisper-client-api-url endpoint))
          (json-data (encode-coding-string (json-serialize data) 'utf-8))
          (url-request-method "POST")
@@ -188,37 +209,10 @@ CALLBACK receives parsed JSON (alist or vector)."
                         (let* ((response-buffer (current-buffer))
                                (json-response (whisper-client-url-parse-json response-buffer)))
                           (kill-buffer response-buffer)
-                          ;; Se for um vetor (array) ou se for uma lista sem campo "error"
-                          (if (and json-response
-                                   (or (vectorp json-response)
-                                       (not (assq 'error json-response))))
-                              (funcall callback json-response)
-                            (when error-callback
-                              (funcall error-callback (format "API error: %s"
-                                                              (or (cdr (assq 'error json-response))
-                                                                  "unknown"))))))))
-                  nil nil t)))
-
-(defun whisper-client-api-get (endpoint callback &optional error-callback)
-  "Send a GET request to ENDPOINT.
-CALLBACK receives parsed JSON (alist or vector)."
-  (let ((url (concat whisper-client-api-url endpoint)))
-    (url-retrieve url
-                  (lambda (status)
-                    (let ((err (plist-get status :error)))
-                      (if err
-                          (when error-callback (funcall error-callback (format "Network error: %s" err)))
-                        (let* ((response-buffer (current-buffer))
-                               (json-response (whisper-client-url-parse-json response-buffer)))
-                          (kill-buffer response-buffer)
-                          (if (and json-response
-                                   (or (vectorp json-response)
-                                       (not (assq 'error json-response))))
-                              (funcall callback json-response)
-                            (when error-callback
-                              (funcall error-callback (format "API error: %s"
-                                                              (or (cdr (assq 'error json-response))
-                                                                  "unknown"))))))))
+                          (if (whisper-client--is-error-response json-response)
+                              (when error-callback
+                                (funcall error-callback (format "API error: %s" (cdr (assq 'error json-response)))))
+                            (funcall callback json-response))))))
                   nil nil t)))
 
 ;; ----------------------------------------------------------------------
@@ -266,7 +260,7 @@ CALLBACK receives parsed JSON response."
                                 (funcall error-callback (format "API error: %s"
                                                                 (or (cdr (assq 'error json-response))
                                                                     "unknown"))))))))
-                    nil nil t))))
+                    nil nil t)))))
 
 ;; ----------------------------------------------------------------------
 ;; Job polling and insertion
@@ -308,20 +302,28 @@ CALLBACK receives parsed JSON response."
   "Poll the status of JOB-ID asynchronously."
   (whisper-client-api-get (format "/job/%s" job-id)
                     (lambda (response)
-                      (let ((status (cdr (assq 'status response))))
-                        (cond ((string= status "completed")
-                               (whisper-client-handle-job-completion job-id response))
-                              ((string= status "failed")
-                               (let ((error-msg (cdr (assq 'error response))))
-                                 (message "[Whisper] Job %s failed: %s" job-id error-msg)
-                                 (whisper-client-cleanup-job job-id)))
-                              (t ; still pending/processing
-                               (let ((timer (run-at-time whisper-client-poll-interval nil
-                                                         #'whisper-client-poll-job job-id)))
-                                 (let ((job (gethash job-id whisper-client-active-jobs)))
-                                   (when job
-                                     (puthash job-id (plist-put job :timer timer)
-                                              whisper-client-active-jobs))))))))
+                      (if (not (and (consp response) (not (vectorp response))))
+                          ;; Resposta não é um alist (ex.: :null) → re-poll
+                          (let ((timer (run-at-time whisper-client-poll-interval nil
+                                                    #'whisper-client-poll-job job-id)))
+                            (let ((job (gethash job-id whisper-client-active-jobs)))
+                              (when job
+                                (puthash job-id (plist-put job :timer timer)
+                                         whisper-client-active-jobs))))
+                        ;; Resposta é um alist válido
+                        (let ((status (cdr (assq 'status response))))
+                          (cond ((string= status "completed")
+                                 (whisper-client-handle-job-completion job-id response))
+                                ((string= status "failed")
+                                 (message "[Whisper] Job %s failed: %s" job-id (cdr (assq 'error response)))
+                                 (whisper-client-cleanup-job job-id))
+                                (t ; pending/processing
+                                 (let ((timer (run-at-time whisper-client-poll-interval nil
+                                                           #'whisper-client-poll-job job-id)))
+                                   (let ((job (gethash job-id whisper-client-active-jobs)))
+                                     (when job
+                                       (puthash job-id (plist-put job :timer timer)
+                                                whisper-client-active-jobs)))))))))
                     (lambda (err)
                       (message "[Whisper] Polling error for %s: %s" job-id err)
                       (whisper-client-cleanup-job job-id))))
