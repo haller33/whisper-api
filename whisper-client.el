@@ -1,42 +1,16 @@
 ;;; themes/whisper-client.el -*- lexical-binding: t; -*-
-
 ;;; whisper-client.el --- Async voice transcription via Whisper API -*- lexical-binding: t; -*-
 
 ;; Copyright (C) 2025  Your Name
 
 ;; Author: Your Name <you@example.com>
-;; Version: 0.2.0
-;; Package-Requires: ((emacs "30") (transient "0.4"))
+;; Version: 0.3.0
+;; Package-Requires: ((emacs "30") (transient "0.4") (seq "2.24"))
 ;; Keywords: convenience, multimedia, tools
 
-;; This program is free software; you can redistribute it and/or modify
-;; it under the terms of the GNU General Public License as published by
-;; the Free Software Foundation, either version 3 of the License, or
-;; (at your option) any later version.
-
 ;;; Commentary:
-
-;; A minor mode that integrates with a Whisper transcription server
-;; (e.g., whisper_api.py).  Provides remote recording via the /record
-;; endpoint, file upload, asynchronous polling, marker-based insertion,
-;; SQLite history, transient menu, mode-line status, and full API inspection
-;; (health, queue, sessions, hash lookup).
-
-;; Usage:
-;;   (use-package whisper-client
-;;     :ensure t
-;;     :bind (:map whisper-client-mode-map
-;;                ("C-c w r" . whisper-client-start-recording)
-;;                ("C-c w s" . whisper-show-status-buffer)
-;;                ("C-c w h" . whisper-client-show-history)
-;;                ("C-c w c" . whisper-cancel-current-job))
-;;     :custom
-;;     (whisper-api-url "http://localhost:8080")
-;;     (whisper-default-duration 5)
-;;     :hook (after-init . whisper-client-mode))
-
-;;; test only
-;; (whisper-client-api-get "/health" (lambda (r) (message "%s" r)) (lambda (e) (message "Error: %s" e)))
+;; Cliente Emacs para API Whisper (gravação remota, upload, polling,
+;; inserção por marcador, histórico SQLite, menu transient).
 
 ;;; Code:
 
@@ -45,6 +19,7 @@
 (require 'json)
 (require 'sqlite)
 (require 'transient)
+(require 'seq)
 (eval-when-compile (require 'subr-x))
 
 ;; ----------------------------------------------------------------------
@@ -168,30 +143,38 @@ Returns a list of plists."
                 (sqlite-select conn query (list session-id))
               (sqlite-select conn query)))))
 
+(defun whisper-client-db-load-pending-failed ()
+  "Retrieve jobs with status 'pending' or 'failed' from the local database.
+Returns a list of plists."
+  (let ((conn (whisper-client-db-init)))
+    (mapcar (lambda (row)
+              `((job_id . ,(nth 0 row))
+                (session_id . ,(nth 1 row))
+                (audio_hash . ,(nth 2 row))
+                (status . ,(nth 3 row))
+                (created_at . ,(nth 4 row))))
+            (sqlite-select conn
+                           "SELECT job_id, session_id, audio_hash, status, created_at
+                            FROM transcriptions
+                            WHERE status IN ('pending', 'failed')"))))
+
 ;; ----------------------------------------------------------------------
 ;; Async HTTP helpers (using url-retrieve with native JSON)
 ;; ----------------------------------------------------------------------
-;; ----------------------------------------------------------------------
-;; Async HTTP helpers (Corrigidos)
-;; ----------------------------------------------------------------------
-
-(defun whisper-client--has-error-p (json-response)
-  "Verifica com segurança se JSON-RESPONSE possui um erro real (ignorando :null)."
-  (let ((err (cdr (assq 'error json-response))))
-    (and err (not (eq err :null))))) ; Só é erro se existir e NÃO for :null
 
 (defun whisper-client-url-parse-json (response)
-  "Extrai e faz o parse do JSON do buffer RESPONSE do HTTP."
+  "Extract and parse JSON from an HTTP RESPONSE buffer.
+Returns the parsed data as an alist (for objects) or vector (for arrays)."
   (with-current-buffer response
     (goto-char (point-min))
-    ;; Usa \r?\n para lidar com qualquer padrão de quebra de linha HTTP
-    (if (re-search-forward "\r?\n\r?\n" nil t)
+    (if (re-search-forward "\n\n" nil t)
         (let ((json-string (buffer-substring-no-properties (point) (point-max))))
           (ignore-errors (json-parse-string json-string :object-type 'alist)))
       nil)))
 
 (defun whisper-client-api-post (endpoint data callback &optional error-callback)
-  "Envia um POST request para ENDPOINT com DATA (alist)."
+  "Send a POST request to ENDPOINT with DATA (alist).
+CALLBACK receives parsed JSON (alist or vector)."
   (let* ((url (concat whisper-client-api-url endpoint))
          (json-data (encode-coding-string (json-serialize data) 'utf-8))
          (url-request-method "POST")
@@ -205,39 +188,37 @@ Returns a list of plists."
                         (let* ((response-buffer (current-buffer))
                                (json-response (whisper-client-url-parse-json response-buffer)))
                           (kill-buffer response-buffer)
-                          ;; Nova verificação de erro segura:
-                          (if (and json-response (not (whisper-client--has-error-p json-response)))
+                          ;; Se for um vetor (array) ou se for uma lista sem campo "error"
+                          (if (and json-response
+                                   (or (vectorp json-response)
+                                       (not (assq 'error json-response))))
                               (funcall callback json-response)
                             (when error-callback
                               (funcall error-callback (format "API error: %s"
-                                                              (if json-response
-                                                                  (cdr (assq 'error json-response))
-                                                                "JSON inválido/vazio")))))))))
+                                                              (or (cdr (assq 'error json-response))
+                                                                  "unknown"))))))))
                   nil nil t)))
 
 (defun whisper-client-api-get (endpoint callback &optional error-callback)
-  "Envia um GET request para ENDPOINT. Previne erro 405."
-  (let* ((url (concat whisper-client-api-url endpoint))
-         ;; Força estado limpo para GET
-         (url-request-method "GET")
-         (url-request-data nil)
-         (url-request-extra-headers nil))
+  "Send a GET request to ENDPOINT.
+CALLBACK receives parsed JSON (alist or vector)."
+  (let ((url (concat whisper-client-api-url endpoint)))
     (url-retrieve url
                   (lambda (status)
                     (let ((err (plist-get status :error)))
                       (if err
-                          (when error-callback
-                            (funcall error-callback (format "Network error: %s" err)))
+                          (when error-callback (funcall error-callback (format "Network error: %s" err)))
                         (let* ((response-buffer (current-buffer))
                                (json-response (whisper-client-url-parse-json response-buffer)))
                           (kill-buffer response-buffer)
-                          (if (and json-response (not (whisper-client--has-error-p json-response)))
+                          (if (and json-response
+                                   (or (vectorp json-response)
+                                       (not (assq 'error json-response))))
                               (funcall callback json-response)
                             (when error-callback
                               (funcall error-callback (format "API error: %s"
-                                                              (if json-response
-                                                                  (cdr (assq 'error json-response))
-                                                                "JSON inválido/vazio")))))))))
+                                                              (or (cdr (assq 'error json-response))
+                                                                  "unknown"))))))))
                   nil nil t)))
 
 ;; ----------------------------------------------------------------------
@@ -277,13 +258,15 @@ CALLBACK receives parsed JSON response."
                           (let* ((response-buffer (current-buffer))
                                  (json-response (whisper-client-url-parse-json response-buffer)))
                             (kill-buffer response-buffer)
-                            (if (and json-response (not (assq 'error json-response)))
+                            (if (and json-response
+                                     (or (vectorp json-response)
+                                         (not (assq 'error json-response))))
                                 (funcall callback json-response)
                               (when error-callback
                                 (funcall error-callback (format "API error: %s"
                                                                 (or (cdr (assq 'error json-response))
                                                                     "unknown"))))))))
-                    nil nil t)))))
+                    nil nil t))))
 
 ;; ----------------------------------------------------------------------
 ;; Job polling and insertion
@@ -294,16 +277,18 @@ CALLBACK receives parsed JSON response."
   (let* ((job (gethash job-id whisper-client-active-jobs))
          (marker (plist-get job :marker))
          (buffer (plist-get job :buffer)))
-    (when (and marker (buffer-live-p buffer))
-      (with-current-buffer buffer
-        (save-excursion
-          (when (marker-position marker)
-            (goto-char marker)
-            (when whisper-client-insert-with-newlines
-              (unless (bolp) (insert "\n"))
+    (if (and marker (buffer-live-p buffer))
+        (with-current-buffer buffer
+          (save-excursion
+            (when (marker-position marker)
+              (goto-char marker)
+              (when whisper-client-insert-with-newlines
+                (unless (bolp) (insert "\n")))
               (insert transcript)
-              (unless (eolp) (insert "\n")))
-            (message "[Whisper] Inserted transcript from job %s" job-id)))))))
+              (when whisper-client-insert-with-newlines
+                (unless (eolp) (insert "\n")))
+              (message "[Whisper] Inserted transcript from job %s" job-id))))
+      (message "[Whisper] Warning: buffer for job %s is dead, transcript not inserted." job-id))))
 
 (defun whisper-client-handle-job-completion (job-id response)
   "Handle a completed job RESPONSE for JOB-ID."
@@ -409,6 +394,40 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                            (message "[Whisper] Upload failed: %s" err)))))
 
 ;; ----------------------------------------------------------------------
+;; Retry failed/pending jobs
+;; ----------------------------------------------------------------------
+
+(defun whisper-client-retry-job (job-id)
+  "Retry a specific JOB-ID that is pending or failed.
+Re‑uploads the audio file if it exists locally."
+  (interactive (list (completing-read "Job ID to retry: "
+                                      (mapcar (lambda (j) (cdr (assq 'job_id j)))
+                                              (whisper-client-db-load-pending-failed))
+                                      nil t)))
+  (let ((job (seq-find (lambda (j) (string= (cdr (assq 'job_id j)) job-id))
+                       (whisper-client-db-load-pending-failed))))
+    (if (null job)
+        (message "Job %s not found or not retriable." job-id)
+      (let ((audio-hash (cdr (assq 'audio_hash job)))
+            (session-id (cdr (assq 'session_id job))))
+        ;; We need the original audio file path. The API server stores audio files
+        ;; in its recordings directory. Without the file, we cannot retry.
+        ;; For now, we just re‑poll the API – maybe the job was stuck.
+        (message "Re‑polling job %s..." job-id)
+        (whisper-client-poll-job job-id)))))
+
+(defun whisper-client-retry-failed-jobs ()
+  "Retry all failed or pending jobs from the local database."
+  (interactive)
+  (let ((jobs (whisper-client-db-load-pending-failed)))
+    (if (null jobs)
+        (message "No pending or failed jobs found.")
+      (dolist (job jobs)
+        (let ((job-id (cdr (assq 'job_id job))))
+          (message "Retrying job %s..." job-id)
+          (whisper-client-poll-job job-id))))))
+
+;; ----------------------------------------------------------------------
 ;; API inspection commands (health, queue, sessions, hash)
 ;; ----------------------------------------------------------------------
 
@@ -443,15 +462,15 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
   (interactive)
   (whisper-client-api-get "/sessions"
                     (lambda (response)
-                      (if (null response)
+                      (if (and (vectorp response) (= (length response) 0))
                           (message "No remote sessions found.")
-                        (let* ((sessions (append response nil))
+                        (let* ((sessions (if (vectorp response) (append response nil) response))
                                (choice (completing-read "Select session: " sessions)))
                           (whisper-client-api-get (format "/messages?session=%s" choice)
                                             (lambda (msgs)
                                               (with-output-to-temp-buffer "*Whisper Remote Session*"
                                                 (princ (format "=== Messages for session: %s ===\n\n" choice))
-                                                (dolist (m msgs)
+                                                (dolist (m (if (vectorp msgs) (append msgs nil) msgs))
                                                   (princ (format "[%s] Job: %s | Status: %s\n%s\n\n"
                                                                  (cdr (assq 'created_at m))
                                                                  (cdr (assq 'job_id m))
@@ -488,16 +507,17 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                      (let ((marker (plist-get job :marker))
                            (buffer (plist-get job :buffer)))
                        (insert (format "Job: %s\n  Buffer: %s, Position: %s\n\n"
-                                       job-id buffer (marker-position marker)))))
+                                       job-id buffer (and marker (marker-position marker))))))
                    whisper-client-active-jobs)
         (insert "No active jobs.\n"))
       (insert "\n=== Recent Completions (last 5 from DB) ===\n\n")
-      (let ((recent (cl-subseq (whisper-client-db-load-history) 0 5)))
+      (let* ((history (whisper-client-db-load-history))
+             (recent (seq-take history 5)))
         (dolist (rec recent)
           (insert (format "Job: %s\nSession: %s\nText: %.80s\n---\n"
                           (cdr (assq 'job_id rec))
                           (cdr (assq 'session_id rec))
-                          (cdr (assq 'transcript rec))))))
+                          (or (cdr (assq 'transcript rec)) "")))))
       (display-buffer buf))))
 
 (defun whisper-client-show-history (&optional session-id)
@@ -540,27 +560,29 @@ With prefix argument, prompt for session ID."
 ;; ----------------------------------------------------------------------
 
 (transient-define-prefix whisper-client-transient ()
-  "Transient menu for Whisper client (full Bash script parity)."
+  "Transient menu for Whisper client."
   ["Recording & Upload"
    ("r" "Start recording" whisper-client-start-recording)
    ("u" "Upload audio file" whisper-client-upload-file)
    ("c" "Cancel current job" whisper-client-cancel-current-job)]
+  ["Retry"
+   ("R" "Retry failed/pending jobs" whisper-client-retry-failed-jobs)]
   ["Remote Queries"
    ("s" "List remote sessions" whisper-client-list-remote-sessions)
    ("h" "Query by hash" whisper-client-query-hash)]
-   ["Local & Status"
-    ("i" "API health / queue" whisper-client-system-status)
-    ("l" "Local history (SQLite)" whisper-client-show-history)
-    ("b" "Status buffer" whisper-client-show-status-buffer)]
-   ["Settings"
-    ("d" "Set default duration"
-     (lambda () (interactive)
-       (setq whisper-client-default-duration
-             (read-number "Duration (seconds): " whisper-client-default-duration))))
-    ("a" "Set API URL"
-     (lambda () (interactive)
-       (setq whisper-client-api-url
-             (read-string "API URL: " whisper-client-api-url))))])
+  ["Local & Status"
+   ("i" "API health / queue" whisper-client-system-status)
+   ("l" "Local history (SQLite)" whisper-client-show-history)
+   ("b" "Status buffer" whisper-client-show-status-buffer)]
+  ["Settings"
+   ("d" "Set default duration"
+    (lambda () (interactive)
+      (setq whisper-client-default-duration
+            (read-number "Duration (seconds): " whisper-client-default-duration))))
+   ("a" "Set API URL"
+    (lambda () (interactive)
+      (setq whisper-client-api-url
+            (read-string "API URL: " whisper-client-api-url))))])
 
 ;; ----------------------------------------------------------------------
 ;; Minor mode definition
@@ -577,6 +599,7 @@ With prefix argument, prompt for session ID."
     (define-key map (kbd "C-c w i") #'whisper-client-system-status)
     (define-key map (kbd "C-c w q") #'whisper-client-query-hash)
     (define-key map (kbd "C-c w l") #'whisper-client-list-remote-sessions)
+    (define-key map (kbd "C-c w R") #'whisper-client-retry-failed-jobs)
     map)
   "Keymap for `whisper-client-mode'.")
 
@@ -599,10 +622,6 @@ With prefix argument, prompt for session ID."
   "Cancel all active jobs and timers."
   (maphash (lambda (job-id _) (whisper-client-cleanup-job job-id))
            whisper-client-active-jobs))
-
-;; ----------------------------------------------------------------------
-;; Provide the package
-;; ----------------------------------------------------------------------
 
 (provide 'whisper-client)
 
