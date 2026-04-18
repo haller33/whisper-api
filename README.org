@@ -1,0 +1,184 @@
+#+TITLE: Whisper Transcriber – API + Emacs Client
+#+AUTHOR: Your Name
+#+OPTIONS: toc:nil num:nil
+
+* What is this?
+
+A self‑hosted voice transcription system using OpenAI’s Whisper.
+It provides:
+
+- A **Python HTTP server** (`whisper_api.py`) that records from the
+  microphone, uploads audio files, runs Whisper asynchronously, and
+  stores results in SQLite.
+- An **Emacs minor mode** (`whisper-client.el`) that talks to the API,
+  inserts transcripts exactly where your cursor was (via markers),
+  polls jobs in the background, and keeps a local history.
+
+Also includes a **Bash test script** (`test_whisper_api.sh`) for
+quick CLI testing.
+
+--------------------------------------------------------------------
+* Quick start
+
+** 1. Start the API server
+
+Inside the project directory (using Nix or a plain Python env):
+
+#+begin_src bash
+# With uv (recommended)
+uv venv
+source .venv/bin/activate
+uv pip install -r requirements.txt
+
+# Or with pip
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+
+# Run the server
+python whisper_api.py
+#+end_src
+
+The server listens on `http://localhost:8080` by default.
+
+** 2. Enable the Emacs client
+
+Add to your Emacs config:
+
+#+begin_src elisp
+(use-package whisper-client
+  :load-path "/path/to/whisper-client.el"
+  :bind (:map whisper-client-mode-map
+              ("C-c w r" . whisper-client-start-recording)
+              ("C-c w t" . whisper-client-transient))
+  :custom
+  (whisper-client-api-url "http://localhost:8080")
+  (whisper-client-default-duration 5)
+  :hook (after-init . whisper-client-mode))
+#+end_src
+
+Then `M-x whisper-client-mode` to activate the global minor mode.
+
+--------------------------------------------------------------------
+* API server – environment variables
+
+Set these before starting `whisper_api.py` (or in a `.env` file):
+
+| Variable                    | Default               | Description                                 |
+|-----------------------------+-----------------------+---------------------------------------------|
+| `WHISPER_AUDIO_DIR`         | `./recordings`        | Where uploaded/recorded audio files go      |
+| `WHISPER_DB_PATH`           | `./transcriptions.db` | SQLite database for jobs                    |
+| `WHISPER_MODEL`             | `large-v3-turbo`      | Whisper model (e.g., `base`, `large`)       |
+| `WHISPER_CHUNK_DURATION`    | `30`                  | Seconds per chunk (manual method only)      |
+| `WHISPER_HOST`              | `0.0.0.0`             | Flask host                                  |
+| `WHISPER_PORT`              | `8080`                | Flask port                                  |
+| `WHISPER_USE_CUDA`          | `auto`                | `auto`/`yes`/`no`                           |
+| `WHISPER_CHUNKING_METHOD`   | `direct`              | `direct` (good) or `manual` (debug)         |
+
+--------------------------------------------------------------------
+* Emacs client – usage & commands
+
+The minor mode provides:
+
+- **Asynchronous recording** – runs on the server, no Emacs blocking.
+- **Marker insertion** – transcript appears exactly where you started,
+  even minutes later.
+- **Local SQLite history** – every transcript is saved.
+- **Mode‑line indicator** – shows `Whisper[2]` while jobs run.
+
+** Interactive commands
+
+| Command                               | Key        | Description                         |
+|---------------------------------------+------------+-------------------------------------|
+| `whisper-client-start-recording`      | `C-c w r`  | Record for N seconds                |
+| `whisper-client-upload-file`          | `C-c w u`  | Upload an audio file                |
+| `whisper-client-show-status-buffer`   | `C-c w s`  | Show active jobs + recent completions |
+| `whisper-client-show-history`         | `C-c w h`  | Browse local SQLite history         |
+| `whisper-client-cancel-current-job`   | `C-c w c`  | Cancel a running job                |
+| `whisper-client-system-status`        | `C-c w i`  | Check API health and queue size     |
+| `whisper-client-query-hash`           | `C-c w q`  | Look up transcript by audio hash    |
+| `whisper-client-list-remote-sessions` | `C-c w l`  | List sessions from the API          |
+| `whisper-client-transient`            | `C-c w t`  | Open the Transient menu             |
+
+** Transient menu
+
+Press `C-c w t` to get a popup menu with all actions grouped:
+
+- Recording & Upload
+- Remote Queries (sessions, hash)
+- Local & Status (history, health)
+- Settings (default duration, API URL)
+
+** Customisation variables
+
+| Variable                                 | Default                         |
+|------------------------------------------+---------------------------------|
+| `whisper-client-api-url`                 | `"http://localhost:8080"`       |
+| `whisper-client-default-duration`        | `5`                             |
+| `whisper-client-poll-interval`           | `2` (seconds)                   |
+| `whisper-client-session-id`              | `nil` (auto‑generated)          |
+| `whisper-client-db-file`                 | `~/.emacs.d/whisper-history.sqlite` |
+| `whisper-client-notify-on-completion`    | `t`                             |
+| `whisper-client-insert-with-newlines`    | `t` (adds newlines around text) |
+
+--------------------------------------------------------------------
+* Bash CLI script
+
+`test_whisper_api.sh` provides an interactive terminal menu
+identical to the Emacs client – useful for debugging or when you are
+not inside Emacs.
+
+Run it after starting the API:
+
+#+begin_src bash
+chmod +x test_whisper_api.sh
+./test_whisper_api.sh
+#+end_src
+
+It supports: recording, upload, listing sessions, hash lookup, job
+details, health/queue.
+
+--------------------------------------------------------------------
+* Requirements
+
+- **Python** 3.10+ (with `pip` or `uv`)
+- **Emacs** 30+ (for `sqlite.el`, `json-parse-string`, `transient`)
+- **PortAudio** (for sounddevice) – usually `portaudio` on Linux,
+  included in the Nix shell.
+
+The Nix shell (`shell.nix`) provides all system dependencies:
+
+#+begin_src bash
+nix-shell
+# then uv / pip install -r requirements.txt
+#+end_src
+
+--------------------------------------------------------------------
+* How it works (briefly)
+
+1. `whisper-start-recording` sends `{"duration":5,"session_id":"..."}` to `/record`.
+2. The API returns a `job_id` immediately and starts recording in a
+   background thread.
+3. Emacs creates a marker at point and starts polling `/job/<id>`
+   every 2 seconds.
+4. When the API finishes transcription, Emacs receives the completed
+   job, moves to the marker, and inserts the transcript.
+5. Every transcript is saved both on the server (SQLite) and locally
+   (Emacs SQLite) for history.
+
+--------------------------------------------------------------------
+* Troubleshooting
+
+- **405 Method Not Allowed** – Ensure your Emacs uses the corrected
+  `whisper-client-api-post` (the version in the final file works).
+- **No audio device** – Check that `sounddevice` can access your
+  microphone. On Linux you may need `pulseaudio` or `pipewire`.
+- **Model too slow** – Use a smaller model like `"base"` by setting
+  `WHISPER_MODEL=base`.
+- **Emacs cannot find whisper-client** – Add the directory containing
+  `whisper-client.el` to `load-path` or use `load-file`.
+
+--------------------------------------------------------------------
+* License
+
+GPLv3 (same as the original Whisper API script).
