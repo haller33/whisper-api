@@ -171,20 +171,28 @@ Returns a list of plists."
 ;; ----------------------------------------------------------------------
 ;; Async HTTP helpers (using url-retrieve with native JSON)
 ;; ----------------------------------------------------------------------
+;; ----------------------------------------------------------------------
+;; Async HTTP helpers (Corrigidos)
+;; ----------------------------------------------------------------------
+
+(defun whisper-client--has-error-p (json-response)
+  "Verifica com segurança se JSON-RESPONSE possui um erro real (ignorando :null)."
+  (let ((err (cdr (assq 'error json-response))))
+    (and err (not (eq err :null))))) ; Só é erro se existir e NÃO for :null
 
 (defun whisper-client-url-parse-json (response)
-  "Extract and parse JSON from an HTTP RESPONSE buffer.
-Returns the parsed data as an alist or nil on error."
+  "Extrai e faz o parse do JSON do buffer RESPONSE do HTTP."
   (with-current-buffer response
     (goto-char (point-min))
-    (if (re-search-forward "\n\n" nil t)
+    ;; Usa \r?\n para lidar com qualquer padrão de quebra de linha HTTP
+    (if (re-search-forward "\r?\n\r?\n" nil t)
         (let ((json-string (buffer-substring-no-properties (point) (point-max))))
           (ignore-errors (json-parse-string json-string :object-type 'alist)))
       nil)))
 
-(defun whisper--api-post (endpoint data callback &optional error-callback)
-  "Send a POST request to ENDPOINT with DATA (alist)."
-  (let* ((url (concat whisper-api-url endpoint))
+(defun whisper-client-api-post (endpoint data callback &optional error-callback)
+  "Envia um POST request para ENDPOINT com DATA (alist)."
+  (let* ((url (concat whisper-client-api-url endpoint))
          (json-data (encode-coding-string (json-serialize data) 'utf-8))
          (url-request-method "POST")
          (url-request-extra-headers '(("Content-Type" . "application/json")))
@@ -195,46 +203,25 @@ Returns the parsed data as an alist or nil on error."
                       (if err
                           (when error-callback (funcall error-callback (format "Network error: %s" err)))
                         (let* ((response-buffer (current-buffer))
-                               (json-response (whisper--url-parse-json response-buffer)))
-                          (kill-buffer response-buffer)
-                          (if (and json-response (not (assq 'error json-response)))
-                              (funcall callback json-response)
-                            (when error-callback
-                              (funcall error-callback (format "API error: %s"
-                                                              (or (cdr (assq 'error json-response))
-                                                                  "unknown"))))))))
-                  nil nil t))))
-    
-(defun whisper-client-api-post-old (endpoint data callback &optional error-callback)
-  "Send a POST request to ENDPOINT with DATA (alist).
-On success, call CALLBACK with the parsed JSON response.
-On error, call ERROR-CALLBACK with the error message."
-  (let ((url (concat whisper-client-api-url endpoint))
-        (json-data (encode-coding-string (json-serialize data) 'utf-8)))
-    (url-retrieve url
-                  (lambda (status)
-                    (let ((err (plist-get status :error)))
-                      (if err
-                          (when error-callback
-                            (funcall error-callback (format "Network error: %s" err)))
-                        (let* ((response-buffer (current-buffer))
                                (json-response (whisper-client-url-parse-json response-buffer)))
                           (kill-buffer response-buffer)
-                          (if (and json-response (not (assq 'error json-response)))
+                          ;; Nova verificação de erro segura:
+                          (if (and json-response (not (whisper-client--has-error-p json-response)))
                               (funcall callback json-response)
                             (when error-callback
                               (funcall error-callback (format "API error: %s"
-                                                              (or (cdr (assq 'error json-response))
-                                                                  "unknown"))))))))
-                  nil '(("Content-Type" . "application/json"))
-                  (concat "Content-Length: " (number-to-string (length json-data)) "\r\n"
-                          json-data)))))
+                                                              (if json-response
+                                                                  (cdr (assq 'error json-response))
+                                                                "JSON inválido/vazio")))))))))
+                  nil nil t)))
 
 (defun whisper-client-api-get (endpoint callback &optional error-callback)
-  "Send a GET request to ENDPOINT.
-CALLBACK receives parsed JSON on success.
-ERROR-CALLBACK receives error string on failure."
-  (let ((url (concat whisper-client-api-url endpoint)))
+  "Envia um GET request para ENDPOINT. Previne erro 405."
+  (let* ((url (concat whisper-client-api-url endpoint))
+         ;; Força estado limpo para GET
+         (url-request-method "GET")
+         (url-request-data nil)
+         (url-request-extra-headers nil))
     (url-retrieve url
                   (lambda (status)
                     (let ((err (plist-get status :error)))
@@ -244,13 +231,14 @@ ERROR-CALLBACK receives error string on failure."
                         (let* ((response-buffer (current-buffer))
                                (json-response (whisper-client-url-parse-json response-buffer)))
                           (kill-buffer response-buffer)
-                          (if (and json-response (not (assq 'error json-response)))
+                          (if (and json-response (not (whisper-client--has-error-p json-response)))
                               (funcall callback json-response)
                             (when error-callback
                               (funcall error-callback (format "API error: %s"
-                                                              (or (cdr (assq 'error json-response))
-                                                                  "unknown"))))))))
-                  nil nil nil))))
+                                                              (if json-response
+                                                                  (cdr (assq 'error json-response))
+                                                                "JSON inválido/vazio")))))))))
+                  nil nil t)))
 
 ;; ----------------------------------------------------------------------
 ;; Multipart upload for files (POST /upload)
