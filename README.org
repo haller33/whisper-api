@@ -181,4 +181,5 @@ nix-shell
 --------------------------------------------------------------------
 * License
 
-GPLv3 (same as the original Whisper API script).
+MIT License
+
