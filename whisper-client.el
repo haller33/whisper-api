@@ -1,15 +1,15 @@
 ;;; whisper-client.el --- Async voice transcription via Whisper API -*- lexical-binding: t; -*-
 
-;; Copyright (C) 2026 Haller33
+;; Copyright (C) 2026  haller33
 
-;; Author: Eliseu Lucena Barros <you@example.com>
-;; Version: 0.3.0
+;; Author: Your Name <you@example.com>
+;; Version: 0.4.0
 ;; Package-Requires: ((emacs "30") (transient "0.4") (seq "2.24"))
 ;; Keywords: convenience, multimedia, tools
 
 ;;; Commentary:
 ;; Cliente Emacs para API Whisper (gravação remota, upload, polling,
-;; inserção por marcador, histórico SQLite, menu transient).
+;; inserção por marcador com animação, histórico SQLite, menu transient).
 
 ;;; Code:
 
@@ -78,18 +78,27 @@ buffer name and timestamp."
   :type 'boolean
   :group 'whisper-client)
 
+(defcustom whisper-client-spinner-interval 0.15
+  "Seconds between spinner animation steps."
+  :type 'float
+  :group 'whisper-client)
+
 ;; ----------------------------------------------------------------------
 ;; Internal state
 ;; ----------------------------------------------------------------------
 
 (defvar whisper-client-active-jobs (make-hash-table :test 'equal)
-  "Hash table mapping job-id to a plist of (marker buffer timer).")
+  "Hash table mapping job-id to a plist of (marker buffer timer spinner-timer).")
 
 (defvar whisper-client-mode-line-string ""
   "Current mode-line indicator string.")
 
 (defvar whisper-client-db-connection nil
   "SQLite connection to the history database.")
+
+;; Spinner characters
+(defvar whisper-client-spinner-chars ["|" "/" "-" "\\"])
+(defvar whisper-client-spinner-index 0)
 
 ;; ----------------------------------------------------------------------
 ;; Database initialization and helpers
@@ -158,7 +167,7 @@ Returns a list of plists."
                             WHERE status IN ('pending', 'failed')"))))
 
 ;; ----------------------------------------------------------------------
-;; Async HTTP helpers (using url-retrieve with native JSON)
+;; Async HTTP helpers (corrigidos para tratar :null como sucesso)
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-url-parse-json (response)
@@ -172,10 +181,10 @@ Returns a list of plists."
 
 (defun whisper-client--is-error-response (response)
   "Return non-nil if RESPONSE is an alist containing a non-null `error' field."
-  (and (consp response)                     ; must be a list
-       (not (vectorp response))             ; not a vector
+  (and (consp response)
+       (not (vectorp response))
        (let ((err (cdr (assq 'error response))))
-         (and err (not (eq err :null))))))  ; error present and not :null
+         (and err (not (eq err :null))))))
 
 (defun whisper-client-api-get (endpoint callback &optional error-callback)
   "Send a GET request to ENDPOINT."
@@ -216,73 +225,103 @@ Returns a list of plists."
                   nil nil t)))
 
 ;; ----------------------------------------------------------------------
-;; Multipart upload for files (POST /upload)
+;; Spinner overlay management (fixed)
 ;; ----------------------------------------------------------------------
 
-(defun whisper-client-api-upload (endpoint file-path session-id callback &optional error-callback)
-  "Upload a file using multipart/form-data to ENDPOINT.
-FILE-PATH is the audio file. SESSION-ID is a string (may be empty).
-CALLBACK receives parsed JSON response."
-  (let* ((url (concat whisper-client-api-url endpoint))
-         (boundary (format "WhisperEmacsBoundary%s" (md5 (format "%s" (current-time)))))
-         (filename (file-name-nondirectory file-path))
-         (file-content (with-temp-buffer
-                         (set-buffer-multibyte nil)
-                         (insert-file-contents-literally file-path)
-                         (buffer-string)))
-         (body (concat
-                "--" boundary "\r\n"
-                "Content-Disposition: form-data; name=\"session_id\"\r\n\r\n"
-                (or session-id "") "\r\n"
-                "--" boundary "\r\n"
-                "Content-Disposition: form-data; name=\"file\"; filename=\"" filename "\"\r\n"
-                "Content-Type: application/octet-stream\r\n\r\n"
-                file-content "\r\n"
-                "--" boundary "--\r\n")))
-    (let ((url-request-method "POST")
-          (url-request-extra-headers
-           `(("Content-Type" . ,(concat "multipart/form-data; boundary=" boundary))
-             ("Content-Length" . ,(number-to-string (string-bytes body)))))
-          (url-request-data body))
-      (url-retrieve url
-                    (lambda (status)
-                      (let ((err (plist-get status :error)))
-                        (if err
-                            (when error-callback (funcall error-callback (format "Network error: %s" err)))
-                          (let* ((response-buffer (current-buffer))
-                                 (json-response (whisper-client-url-parse-json response-buffer)))
-                            (kill-buffer response-buffer)
-                            (if (and json-response
-                                     (or (vectorp json-response)
-                                         (not (assq 'error json-response))))
-                                (funcall callback json-response)
-                              (when error-callback
-                                (funcall error-callback (format "API error: %s"
-                                                                (or (cdr (assq 'error json-response))
-                                                                    "unknown"))))))))
-                    nil nil t)))))
+(defun whisper-client-create-spinner (marker)
+  "Create an overlay at MARKER that will hold the spinner animation."
+  (let ((overlay (make-overlay marker marker)))
+    (overlay-put overlay 'face '(:foreground "cyan" :weight bold))
+    (overlay-put overlay 'whisper-spinner t)
+    (overlay-put overlay 'evaporate t)
+    (overlay-put overlay 'before-string "| ")
+    overlay))
+
+(defun whisper-client-start-spinner-timer (job-id)
+  "Start the spinner animation timer for JOB-ID."
+  (let ((job (gethash job-id whisper-client-active-jobs)))
+    (when job
+      ;; Cancel any existing timer first
+      (let ((old-timer (plist-get job :spinner-timer)))
+        (when old-timer (cancel-timer old-timer)))
+      (let ((timer (run-at-time 0 whisper-client-spinner-interval
+                                #'whisper-client-update-spinner job-id)))
+        (puthash job-id (plist-put job :spinner-timer timer)
+                 whisper-client-active-jobs)))))
+
+(defun whisper-client-update-spinner (job-id)
+  "Cycle spinner characters for JOB-ID."
+  (let ((job (gethash job-id whisper-client-active-jobs)))
+    (when job
+      (let* ((overlay (plist-get job :spinner-overlay))
+             (buffer (plist-get job :buffer))
+             (idx (or (plist-get job :spinner-idx) 0))
+             (next-idx (mod (1+ idx) (length whisper-client-spinner-chars)))
+             (char (aref whisper-client-spinner-chars idx)))
+        (when (and overlay (overlayp overlay) (buffer-live-p buffer))
+          (with-current-buffer buffer
+            (overlay-put overlay 'before-string (concat char " "))
+            (puthash job-id (plist-put job :spinner-idx next-idx)
+                     whisper-client-active-jobs)))))))
+
+(defun whisper-client-remove-spinner (job-id)
+  "Remove spinner overlay and cancel timer for JOB-ID."
+  (let ((job (gethash job-id whisper-client-active-jobs)))
+    (when job
+      (let ((overlay (plist-get job :spinner-overlay))
+            (timer (plist-get job :spinner-timer)))
+        (when timer (cancel-timer timer))
+        (when (and overlay (overlayp overlay))
+          (delete-overlay overlay))
+        (puthash job-id (plist-put (plist-put job :spinner-overlay nil) :spinner-timer nil)
+                 whisper-client-active-jobs)))))
+
+(defun whisper-client-cleanup-job (job-id)
+  "Remove JOB-ID from active jobs, cancel timers and remove spinner."
+  (whisper-client-remove-spinner job-id)   ; <-- added
+  (let ((job (gethash job-id whisper-client-active-jobs)))
+    (when job
+      (let ((timer (plist-get job :timer)))
+        (when timer (cancel-timer timer))))
+    (remhash job-id whisper-client-active-jobs))
+  (whisper-client-update-mode-line))
+
+(defun whisper-client-notify (title message)
+  "Send a desktop notification with TITLE and MESSAGE."
+  (cond ((executable-find "notify-send")
+         (call-process "notify-send" nil 0 nil title message))
+        ((executable-find "osascript") ; macOS
+         (call-process "osascript" nil 0 nil
+                       "-e" (format "display notification \"%s\" with title \"%s\"" message title)))
+        (t (message "[Whisper] %s: %s" title message))))
+
+;; Then inside `whisper-client-handle-job-completion`, after inserting:
+;(when whisper-client-notify-on-completion
+;  (whisper-client-notify "Whisper" (format "Transcription ready: %.60s" transcript)))
 
 ;; ----------------------------------------------------------------------
-;; Job polling and insertion
+;; Job polling and insertion (com spinner)
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-insert-transcript (job-id transcript)
-  "Insert TRANSCRIPT at the marker associated with JOB-ID."
+  "Insert TRANSCRIPT at the marker associated with JOB-ID.
+Handles read-only buffers temporarily."
   (let* ((job (gethash job-id whisper-client-active-jobs))
          (marker (plist-get job :marker))
          (buffer (plist-get job :buffer)))
     (if (and marker (buffer-live-p buffer))
         (with-current-buffer buffer
-          (save-excursion
-            (when (marker-position marker)
-              (goto-char marker)
-              (when whisper-client-insert-with-newlines
-                (unless (bolp) (insert "\n")))
-              (insert transcript)
-              (when whisper-client-insert-with-newlines
-                (unless (eolp) (insert "\n")))
-              (message "[Whisper] Inserted transcript from job %s" job-id))))
-      (message "[Whisper] Warning: buffer for job %s is dead, transcript not inserted." job-id))))
+          (let ((inhibit-read-only t))  ; allow insertion even in read-only buffers
+            (save-excursion
+              (when (marker-position marker)
+                (goto-char marker)
+                (when whisper-client-insert-with-newlines
+                  (unless (bolp) (insert "\n")))
+                (insert transcript)
+                (when whisper-client-insert-with-newlines
+                  (unless (eolp) (insert "\n")))
+                (message "[Whisper] Inserted transcript from job %s" job-id))))))
+    (whisper-client-remove-spinner job-id)))
 
 (defun whisper-client-handle-job-completion (job-id response)
   "Handle a completed job RESPONSE for JOB-ID."
@@ -295,7 +334,9 @@ CALLBACK receives parsed JSON response."
       (whisper-client-insert-transcript job-id transcript)
       (whisper-client-db-save job-id session-id transcript language audio-hash status)
       (when whisper-client-notify-on-completion
-        (message "[Whisper] Transcription ready: %.60s" transcript)))
+        (message "[Whisper] Transcription ready: %.60s" transcript)
+        (whisper-client-notify "Whisper" (format "Transcription ready: %.60s" transcript))))
+
     (whisper-client-cleanup-job job-id)))
 
 (defun whisper-client-poll-job (job-id)
@@ -311,6 +352,7 @@ CALLBACK receives parsed JSON response."
                                 (puthash job-id (plist-put job :timer timer)
                                          whisper-client-active-jobs))))
                         ;; Resposta é um alist válido
+                        (whisper-client-notify "Whisper" "Polling job")
                         (let ((status (cdr (assq 'status response))))
                           (cond ((string= status "completed")
                                  (whisper-client-handle-job-completion job-id response))
@@ -329,13 +371,17 @@ CALLBACK receives parsed JSON response."
                       (whisper-client-cleanup-job job-id))))
 
 (defun whisper-client-cleanup-job (job-id)
-  "Remove JOB-ID from active jobs and cancel its timer."
+  "Remove JOB-ID from active jobs, cancel timers and remove spinner."
   (let ((job (gethash job-id whisper-client-active-jobs)))
     (when job
-      (let ((timer (plist-get job :timer)))
-        (when timer (cancel-timer timer)))
-      (remhash job-id whisper-client-active-jobs)))
-  (whisper-client-update-mode-line))
+      (let ((timer (plist-get job :timer))
+            (spinner-timer (plist-get job :spinner-timer))
+            (overlay (plist-get job :spinner-overlay)))
+        (when timer (cancel-timer timer))
+        (when spinner-timer (cancel-timer spinner-timer))
+        (when (and overlay (overlayp overlay)) (delete-overlay overlay))
+        (remhash job-id whisper-client-active-jobs)))
+  (whisper-client-update-mode-line)))
 
 (defun whisper-client-start-recording (duration &optional session-id)
   "Start a remote recording of DURATION seconds.
@@ -354,10 +400,15 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                            (when job-id
                              (let ((marker (make-marker)))
                                (set-marker marker current-point current-buf)
-                               (puthash job-id (list :marker marker
-                                                     :buffer current-buf
-                                                     :timer nil)
-                                        whisper-client-active-jobs)
+                               ;; Create spinner overlay
+                               (let ((overlay (whisper-client-create-spinner marker)))
+                                 (puthash job-id (list :marker marker
+                                                       :buffer current-buf
+                                                       :timer nil
+                                                       :spinner-overlay overlay
+                                                       :spinner-timer nil)
+                                          whisper-client-active-jobs)
+                                 (whisper-client-start-spinner-timer job-id))
                                (whisper-client-update-mode-line)
                                (message "[Whisper] Recording started, job %s" job-id)
                                (whisper-client-poll-job job-id)))))
@@ -365,7 +416,7 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                          (message "[Whisper] Failed to start recording: %s" err)))))
 
 ;; ----------------------------------------------------------------------
-;; File upload command
+;; File upload command (com spinner)
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-upload-file (file &optional session-id)
@@ -385,10 +436,14 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                              (when job-id
                                (let ((marker (make-marker)))
                                  (set-marker marker current-point current-buf)
-                                 (puthash job-id (list :marker marker
-                                                       :buffer current-buf
-                                                       :timer nil)
-                                          whisper-client-active-jobs)
+                                 (let ((overlay (whisper-client-create-spinner marker)))
+                                   (puthash job-id (list :marker marker
+                                                         :buffer current-buf
+                                                         :timer nil
+                                                         :spinner-overlay overlay
+                                                         :spinner-timer nil)
+                                            whisper-client-active-jobs)
+                                   (whisper-client-start-spinner-timer job-id))
                                  (whisper-client-update-mode-line)
                                  (message "[Whisper] Upload done, job %s" job-id)
                                  (whisper-client-poll-job job-id)))))
@@ -396,12 +451,69 @@ Optional SESSION-ID overrides `whisper-client-session-id'."
                            (message "[Whisper] Upload failed: %s" err)))))
 
 ;; ----------------------------------------------------------------------
+;; List active jobs and cancel
+;; ----------------------------------------------------------------------
+
+(defun whisper-client-list-active-jobs ()
+  "Display a buffer listing all active jobs with options to cancel."
+  (interactive)
+  (let ((buf (get-buffer-create "*Whisper Active Jobs*")))
+    (with-current-buffer buf
+      (erase-buffer)
+      (insert "=== Active Whisper Jobs ===\n\n")
+      (if (= (hash-table-count whisper-client-active-jobs) 0)
+          (insert "No active jobs.\n")
+        (maphash (lambda (job-id job)
+                   (let ((marker (plist-get job :marker))
+                         (buffer (plist-get job :buffer))
+                         (pos (if marker (marker-position marker) "unknown")))
+                     (insert (format "Job ID: %s\n  Buffer: %s, Position: %s\n"
+                                     job-id buffer pos))
+                     (insert-button "[Cancel]"
+                                    'action (lambda (btn)
+                                              (let ((job-id (button-get btn 'job-id)))
+                                                (whisper-client-cancel-job-by-id job-id)))
+                                    'job-id job-id)
+                     (insert "\n\n")))
+                 whisper-client-active-jobs))
+      (insert "\nPress `q' to quit, `C-c C-c' to refresh.\n")
+      (goto-char (point-min)))
+    (display-buffer buf)
+    (with-current-buffer buf
+      (let ((map (make-sparse-keymap)))
+        (define-key map (kbd "q") #'quit-window)
+        (define-key map (kbd "C-c C-c") #'whisper-client-list-active-jobs)
+        (use-local-map map)))))
+
+(defun whisper-client-cancel-job-by-id (job-id)
+  "Cancel the active job with JOB-ID."
+  (interactive (list (completing-read "Job ID to cancel: "
+                                      (hash-table-keys whisper-client-active-jobs)
+                                      nil t)))
+  (if (gethash job-id whisper-client-active-jobs)
+      (progn
+        (whisper-client-cleanup-job job-id)
+        (message "Job %s cancelled." job-id)
+        (whisper-client-list-active-jobs)) ; refresh list
+    (message "Job %s not found." job-id)))
+
+(defun whisper-client-cancel-current-job ()
+  "Cancel the most recent active job (or ask for job-id if multiple)."
+  (interactive)
+  (let ((jobs (hash-table-keys whisper-client-active-jobs)))
+    (if (null jobs)
+        (message "No active jobs to cancel.")
+      (let ((job-id (if (cdr jobs)
+                        (completing-read "Cancel job: " jobs nil t)
+                      (car jobs))))
+        (whisper-client-cancel-job-by-id job-id)))))
+
+;; ----------------------------------------------------------------------
 ;; Retry failed/pending jobs
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-retry-job (job-id)
-  "Retry a specific JOB-ID that is pending or failed.
-Re‑uploads the audio file if it exists locally."
+  "Retry a specific JOB-ID that is pending or failed."
   (interactive (list (completing-read "Job ID to retry: "
                                       (mapcar (lambda (j) (cdr (assq 'job_id j)))
                                               (whisper-client-db-load-pending-failed))
@@ -410,13 +522,8 @@ Re‑uploads the audio file if it exists locally."
                        (whisper-client-db-load-pending-failed))))
     (if (null job)
         (message "Job %s not found or not retriable." job-id)
-      (let ((audio-hash (cdr (assq 'audio_hash job)))
-            (session-id (cdr (assq 'session_id job))))
-        ;; We need the original audio file path. The API server stores audio files
-        ;; in its recordings directory. Without the file, we cannot retry.
-        ;; For now, we just re‑poll the API – maybe the job was stuck.
-        (message "Re‑polling job %s..." job-id)
-        (whisper-client-poll-job job-id)))))
+      (message "Re‑polling job %s..." job-id)
+      (whisper-client-poll-job job-id))))
 
 (defun whisper-client-retry-failed-jobs ()
   "Retry all failed or pending jobs from the local database."
@@ -430,7 +537,7 @@ Re‑uploads the audio file if it exists locally."
           (whisper-client-poll-job job-id))))))
 
 ;; ----------------------------------------------------------------------
-;; API inspection commands (health, queue, sessions, hash)
+;; API inspection commands
 ;; ----------------------------------------------------------------------
 
 (defun whisper-client-system-status ()
@@ -545,18 +652,6 @@ With prefix argument, prompt for session ID."
                           (or (cdr (assq 'transcript rec)) "<no transcript>"))))))
     (display-buffer buf)))
 
-(defun whisper-client-cancel-current-job ()
-  "Cancel the most recent active job (or ask for job-id if multiple)."
-  (interactive)
-  (let ((jobs (hash-table-keys whisper-client-active-jobs)))
-    (if (null jobs)
-        (message "No active jobs to cancel.")
-      (let ((job-id (if (cdr jobs)
-                        (completing-read "Cancel job: " jobs nil t)
-                      (car jobs))))
-        (whisper-client-cleanup-job job-id)
-        (message "Job %s cancelled." job-id)))))
-
 ;; ----------------------------------------------------------------------
 ;; Transient menu (full-featured)
 ;; ----------------------------------------------------------------------
@@ -566,7 +661,8 @@ With prefix argument, prompt for session ID."
   ["Recording & Upload"
    ("r" "Start recording" whisper-client-start-recording)
    ("u" "Upload audio file" whisper-client-upload-file)
-   ("c" "Cancel current job" whisper-client-cancel-current-job)]
+   ("c" "Cancel current job" whisper-client-cancel-current-job)
+   ("a" "List active jobs" whisper-client-list-active-jobs)]
   ["Retry"
    ("R" "Retry failed/pending jobs" whisper-client-retry-failed-jobs)]
   ["Remote Queries"
@@ -597,6 +693,7 @@ With prefix argument, prompt for session ID."
     (define-key map (kbd "C-c w s") #'whisper-client-show-status-buffer)
     (define-key map (kbd "C-c w h") #'whisper-client-show-history)
     (define-key map (kbd "C-c w c") #'whisper-client-cancel-current-job)
+    (define-key map (kbd "C-c w a") #'whisper-client-list-active-jobs)
     (define-key map (kbd "C-c w t") #'whisper-client-transient)
     (define-key map (kbd "C-c w i") #'whisper-client-system-status)
     (define-key map (kbd "C-c w q") #'whisper-client-query-hash)
@@ -624,6 +721,10 @@ With prefix argument, prompt for session ID."
   "Cancel all active jobs and timers."
   (maphash (lambda (job-id _) (whisper-client-cleanup-job job-id))
            whisper-client-active-jobs))
+
+;; ----------------------------------------------------------------------
+;; Provide the package
+;; ----------------------------------------------------------------------
 
 (provide 'whisper-client)
 
