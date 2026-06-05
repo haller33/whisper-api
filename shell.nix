@@ -13,7 +13,6 @@ pkgs.mkShell {
   ];
 
   shellHook = ''
-    # Manually build the library path string for the environment
     export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ 
       pkgs.stdenv.cc.cc.lib 
       pkgs.zlib 
@@ -21,15 +20,30 @@ pkgs.mkShell {
       pkgs.ffmpeg
       pkgs.pkg-config
       pkgs.portaudio
-      pkgs.uv
     ]}:$LD_LIBRARY_PATH"
 
-    # Activate your virtual environment automatically
-    if [ -d .venv ]; then
-      source .venv/bin/activate
+    # Create virtual environment if it doesn't exist
+    if [ ! -d .venv ]; then
+      echo "Creating virtual environment with uv..."
+      uv venv .venv
     fi
-    
+
+    # Activate the virtual environment
+    source .venv/bin/activate
+
+    # Install build essentials
+    uv pip install setuptools wheel
+
+    # Install ALL dependencies from requirements.txt without build isolation
+    # This fixes the openai-whisper ModuleNotFoundError for pkg_resources
+    echo "Installing all Python dependencies (this may take a moment)..."
+    uv pip install -r requirements.txt --no-build-isolation
+
     echo "--- NixOS Dev Environment Active ---"
-    echo "Libraries loaded: zlib, libstdc++, libgcc"
+    echo "Python: $(python --version)"
+    echo "Virtual env: $VIRTUAL_ENV"
+    echo "Libraries: zlib, libstdc++, libgcc, ffmpeg, portaudio"
+    echo "All dependencies installed. Ready to run: uv run python whisper_api.py"
+    # uv run python whisper_api.py
   '';
 }
